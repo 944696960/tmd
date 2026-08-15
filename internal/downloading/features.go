@@ -1,9 +1,11 @@
 package downloading
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,6 +43,46 @@ func (pt TweetInDir) GetPath() string {
 
 var mutex sync.Mutex
 
+func writeMediaFileAtomically(path string, body io.Reader, createdAt time.Time) (string, error) {
+	tempFile, err := os.CreateTemp(filepath.Dir(path), ".tmd-download-*")
+	if err != nil {
+		return "", err
+	}
+	tempPath := tempFile.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tempFile.Close()
+		}
+		_ = os.Remove(tempPath)
+	}()
+
+	if _, err := io.Copy(tempFile, body); err != nil {
+		return "", err
+	}
+	if err := tempFile.Close(); err != nil {
+		closed = true
+		return "", err
+	}
+	closed = true
+
+	// Keep the existing best-effort timestamp behavior, but apply it before the
+	// file becomes visible at its final path.
+	_ = os.Chtimes(tempPath, time.Time{}, createdAt)
+
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	finalPath, err := utils.UniquePath(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return "", err
+	}
+	return finalPath, nil
+}
+
 // 任何一个 url 下载失败直接返回
 // TODO: 要么全做，要么不做
 func downloadTweetMedia(ctx context.Context, client *resty.Client, dir string, tweet *twitter.Tweet) error {
@@ -58,23 +100,8 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, dir string, t
 			return err
 		}
 
-		mutex.Lock()
-		path, err := utils.UniquePath(filepath.Join(dir, text+ext))
-		if err != nil {
-			mutex.Unlock()
-			return err
-		}
-		file, err := os.Create(path)
-		mutex.Unlock()
-		if err != nil {
-			return err
-		}
-
-		defer os.Chtimes(path, time.Time{}, tweet.CreatedAt)
-		defer file.Close()
-
-		_, err = file.Write(resp.Body())
-		if err != nil {
+		path := filepath.Join(dir, text+ext)
+		if _, err := writeMediaFileAtomically(path, bytes.NewReader(resp.Body()), tweet.CreatedAt); err != nil {
 			return err
 		}
 	}
