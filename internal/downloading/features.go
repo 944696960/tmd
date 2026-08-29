@@ -391,8 +391,24 @@ func syncUserAndEntity(db *sqlx.DB, user *twitter.User, dir string) (*UserEntity
 }
 
 type TweetInEntity struct {
-	Tweet  *twitter.Tweet
-	Entity *UserEntity
+	Tweet                    *twitter.Tweet
+	Entity                   *UserEntity
+	pendingLatestReleaseTime time.Time
+	pendingMediaCount        int
+}
+
+// CommitPersistedRetryProgress advances watermarks that were held back until
+// the caller confirmed that the failed tweets were written to its retry queue.
+func CommitPersistedRetryProgress(db *sqlx.DB, failed []*TweetInEntity) error {
+	for _, item := range failed {
+		if item == nil || item.pendingLatestReleaseTime.IsZero() {
+			continue
+		}
+		if err := database.UpdateUserEntityTweetStat(db, item.Entity.Id(), item.pendingLatestReleaseTime, item.pendingMediaCount); err != nil {
+			return fmt.Errorf("failed to commit persisted retry watermark for user %s: %w", item.Entity.Name(), err)
+		}
+	}
+	return nil
 }
 
 func (pt TweetInEntity) GetTweet() *twitter.Tweet {
@@ -599,6 +615,14 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}
 	pendingStats := make(map[int]pendingTweetStat)
 	var pendingStatsMtx sync.Mutex
+	mediaProgress := sync.Map{}
+	var retryEntities []*UserEntity
+	var retryEntitiesMtx sync.Mutex
+	retryEntity := func(entity *UserEntity) {
+		retryEntitiesMtx.Lock()
+		retryEntities = append(retryEntities, entity)
+		retryEntitiesMtx.Unlock()
+	}
 
 	producer := func(entity *UserEntity) {
 		defer prodwg.Done()
@@ -607,40 +631,51 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		user := uidToUser[entity.Uid()]
 		cli := twitter.SelectUserMediaClient(ctx, clients)
 		if ctx.Err() != nil {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			return
 		}
 		if cli == nil {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			cancel(fmt.Errorf("no client available"))
 			return
 		}
+		if depthByEntity[entity] > userTweetRateLimit {
+			// A non-blocking rate-limit error would discard GetMeidas' in-memory
+			// cursor and partial results. Waiting here preserves pagination across
+			// as many rate-limit windows as this unusually deep user requires.
+			twitter.SetRateLimitBlocking(cli, true)
+			defer twitter.SetRateLimitBlocking(cli, false)
+		}
 
-		tweets, err := user.GetMeidas(ctx, cli, &utils.TimeRange{Min: entity.LatestReleaseTime()})
+		baseline := entity.LatestReleaseTime()
+		progressValue, _ := mediaProgress.LoadOrStore(entity.Id(), user.NewMediaTimelineProgress(&utils.TimeRange{Min: baseline}))
+		tweets, err := user.ContinueGetMeidas(ctx, cli, progressValue.(*twitter.MediaTimelineProgress))
 		if err == twitter.ErrWouldBlock {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			return
 		}
 		if v, ok := err.(*twitter.TwitterApiError); ok {
 			// 客户端不再可用
 			if v.Code == twitter.ErrExceedPostLimit {
 				twitter.SetClientError(cli, fmt.Errorf("reached the limit for seeing posts today"))
-				userEntityHeap.Push(entity)
+				retryEntity(entity)
 				return
 			} else if v.Code == twitter.ErrAccountLocked {
 				twitter.SetClientError(cli, fmt.Errorf("account is locked"))
-				userEntityHeap.Push(entity)
+				retryEntity(entity)
 				return
 			}
 		}
 		if ctx.Err() != nil {
-			userEntityHeap.Push(entity)
+			retryEntity(entity)
 			return
 		}
 		if err != nil {
+			mediaProgress.Delete(entity.Id())
 			getterLogger.WithField("user", entity.Name()).Warnln("failed to get user medias:", err)
 			return
 		}
+		mediaProgress.Delete(entity.Id())
 
 		if len(tweets) == 0 {
 			if err := database.UpdateUserEntityMediCount(db, entity.Id(), user.MediaCount); err != nil {
@@ -684,6 +719,16 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		return nil, err
 	}
 	defer ants.Release()
+	submitProducer := func(entity *UserEntity) error {
+		prodwg.Add(1)
+		if err := producerPool.Submit(func() {
+			producer(entity)
+		}); err != nil {
+			prodwg.Done()
+			return err
+		}
+		return nil
+	}
 
 	//closer
 	go func() {
@@ -701,27 +746,36 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 					log.WithFields(log.Fields{
 						"user":  entity.Name(),
 						"depth": depth,
-					}).Warnln("user depth greater than the max limit of window")
-					userEntityHeap.Pop()
-					continue
+					}).Warnln("user requires multiple rate-limit windows; processing it alone")
 				}
 
-				if depth+count > userTweetRateLimit {
+				if depth+count > userTweetRateLimit && count > 0 {
 					break
 				}
 
-				prodwg.Add(1)
-				producerPool.Submit(func() {
-					producer(entity)
-				})
+				entity = userEntityHeap.PopValue()
+				if err := submitProducer(entity); err != nil {
+					retryEntity(entity)
+					cancel(fmt.Errorf("failed to submit user media task: %w", err))
+					break
+				}
 				selected = append(selected, depth)
 
 				count += depth
-				//delete(depthByEntity, entity)
-				userEntityHeap.Pop()
 			}
 			log.Debugln(selected)
 			prodwg.Wait()
+
+			// Producers do not mutate the scheduling heap. Deferred entities are
+			// reinserted only after the current batch is completely idle, so a
+			// retry cannot change which entity the scheduler removes.
+			retryEntitiesMtx.Lock()
+			toRetry := retryEntities
+			retryEntities = nil
+			retryEntitiesMtx.Unlock()
+			for _, entity := range toRetry {
+				userEntityHeap.Push(entity)
+			}
 		}
 		close(tweetChan)
 		log.Debugf("getting tweets completed, elapsed time: %v", time.Since(start))
@@ -731,24 +785,33 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}()
 
 	fails := []*TweetInEntity{}
-	failedEntityIDs := make(map[int]struct{})
+	failedProgressByEntity := make(map[int]*TweetInEntity)
 	for pt := range errChan {
 		failed := pt.(*TweetInEntity)
 		fails = append(fails, failed)
-		failedEntityIDs[failed.Entity.Id()] = struct{}{}
+		entityID := failed.Entity.Id()
+		if _, exists := failedProgressByEntity[entityID]; !exists {
+			failedProgressByEntity[entityID] = failed
+		}
 	}
 	cause := context.Cause(ctx)
-	if cause == nil {
-		pendingStatsMtx.Lock()
-		defer pendingStatsMtx.Unlock()
-		for entityID, pending := range pendingStats {
-			if _, failed := failedEntityIDs[entityID]; failed {
-				getterLogger.WithField("user", pending.entity.Name()).Warnln("download failures kept the previous timeline watermark for a safe retry")
-				continue
-			}
-			if err := database.UpdateUserEntityTweetStat(db, entityID, pending.latest, pending.mediaCount); err != nil {
-				return fails, fmt.Errorf("failed to commit timeline watermark for user %s: %w", pending.entity.Name(), err)
-			}
+	pendingStatsMtx.Lock()
+	defer pendingStatsMtx.Unlock()
+	for entityID, failed := range failedProgressByEntity {
+		pending, ok := pendingStats[entityID]
+		if !ok {
+			continue
+		}
+		failed.pendingLatestReleaseTime = pending.latest
+		failed.pendingMediaCount = pending.mediaCount
+		getterLogger.WithField("user", pending.entity.Name()).Warnln("timeline watermark will advance after failed tweets are saved to the retry queue")
+	}
+	for entityID, pending := range pendingStats {
+		if failedProgressByEntity[entityID] != nil {
+			continue
+		}
+		if err := database.UpdateUserEntityTweetStat(db, entityID, pending.latest, pending.mediaCount); err != nil {
+			return fails, fmt.Errorf("failed to commit timeline watermark for user %s: %w", pending.entity.Name(), err)
 		}
 	}
 	log.Debugf("%d users unable to start", userEntityHeap.Size())
